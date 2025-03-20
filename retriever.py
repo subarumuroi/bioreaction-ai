@@ -8,12 +8,14 @@ import pickle
 from sentence_transformers import SentenceTransformer
 import numpy as np
 import time
+import os
 
 # Load a pre-trained embedding model
 model = SentenceTransformer('all-MiniLM-L6-v2')
 
-# FAISS index file
+# FAISS index file and metadata file
 INDEX_FILE = "faiss_index.pkl"
+PAPERS_FILE = "papers.pkl"
 
 def fetch_papers(query, limit=5):
     """
@@ -29,16 +31,19 @@ def fetch_papers(query, limit=5):
 
     url = f"https://api.semanticscholar.org/graph/v1/paper/search?query={query}&fields=title,abstract,url&limit={limit}"
 
-    while True:
-        
-        response = requests.get(url)
+    retry_delay = 2 # Initial delay in seconds for exponentail backoff
+    max_retries =5
 
+    for attempt in range(max_retries):
+        response = requests.get(url)
+    
         if response.status_code == 429:
-            print("Rate limit hi. sleeping for 10 seconds before retrying...")
-            time.sleep(10) # sleep for 10 seconds before retrying
+            print(f"Rate limit hit. Retrying in {retry_delay} seconds...")
+            time.sleep(retry_delay)
+            retry_delay *= 2 # exponential backoff
             continue # retry the request
 
-        if response.status_code == 200:
+        elif response.status_code == 200:
             papers = response.json().get("data",[])
             return [
                 {
@@ -46,56 +51,89 @@ def fetch_papers(query, limit=5):
                     "abstract": paper.get("abstract", "No abstract available"),
                     "url": paper.get("url", "#")
                 }
-                for paper in papers
+                for paper in papers if paper.get("abstract") # Ensure abstract exists
             ]
         else:
             print(f"Error fetching papers: {response.status_code}")
             return []
-    time.sleep(5) #pause between api calls
     
-def create_faiss_index(papers):
+    print("Failed to fetch papers after {max_retries} attempts.")
+
+def load_existing_index():
     """
-    Creates a FAISS index from the research papers and saves it
+    Loads an existing FAISS index and metadata file if they exist.
     """
+    if os.path.exists(INDEX_FILE) and os.path.exists(PAPERS_FILE):
+        with open(INDEX_FILE, "rb") as f:
+            index = pickle.load(f)
+        with open(PAPERS_FILE, "rb") as f:
+            papers = pickle.load(f)
+        return index, papers
+    else:
+        return None, []
+
+def create_faiss_index(new_papers):
+    """
+    Creates or updates the FAISS index from the research papers and saves it
+    """
+    index, existing_papers = load_existing_index()
+
+    # Combine new and old papers, avoiding duplicates
+    paper_titles = {paper["title"] for paper in existing_papers}
+    papers = existing_papers + [p for p in new_papers if p["title"] not in paper_titles]
+
+    
     abstracts = [paper["abstract"] for paper in papers]
     embeddings = model.encode(abstracts, convert_to_numpy = True)
     
-    #test to see as API may be failing to call the abstracts
-    if embeddings.size == 0:
-        print("No valid embeddings found. Skipping FAISS index creation.")
-        return
-    
-    # creat FAISS index
-    index = faiss.IndexFlatL2(embeddings.shape[1])
-    index.add(embeddings)
+    if index is None:
+        index = faiss.IndexFlatL2(embeddings.shape[1])
+        index.add(embeddings) # First time adding embeddings
+    else:
+        existing_embeddings = index.ntotal
+        if existing_embeddings > 0:
+            print(f"Existing FAISS index size: {existing_embeddings}")
 
-    # save index and metadata
+            # check is new embeddings are already in the index
+            _, duplicates_indices = index.search(embeddings, 1) # Find nearest existing match
+            uniuqe_indices = [i for i in range(len(embeddings)) if duplicates_indices[i][0] >= existing_embeddings]
+
+            if uniuqe_indices:
+                new_embeddings = embeddings[uniuqe_indices]
+                index.add(new_embeddings) # add only unique embeddings
+      
+
+    # save updated index and metadata
     with open(INDEX_FILE, "wb") as f:
-        pickle.dump((index, papers), f)
+        pickle.dump(index, f)
+    with open(PAPERS_FILE, "wb") as f:
+        pickle.dump(papers, f)
 
-    print("FAISS index created and saved.")
+    print(f"FAISS index updated with {len(new_papers)} new papers. Total papers: {len(papers)}")
 
 def search_papers(query, top_k = 3):
     """
     Searches FAISS index for the most relevant papers
     """
-    with open(INDEX_FILE, "rb") as f:
-        index, papers = pickle.load(f)
-
+    index, papers = load_existing_index()
+    if index is None or len(papers) == 0:
+        print("No FAISS index found. Run 'create_faiss_index()' first.")
+        return []
     query_embedding = model.encode([query], convert_to_numpy = True)
-    distances, indices = index.search(query_embedding, top_k)
+    actual_k = min(top_k, len(papers))   
+    distances, indices = index.search(query_embedding, actual_k)
 
-    results = [papers[i] for i in indices[0]]
+    results = [papers[i] for i in indices[0] if i < len(papers)]
     return results
    
 # Example usage (run this file directly to test)
 if __name__ == "__main__":
     # Fetch and store in FAISS
     query = "E. coli fermentation medium"
-    papers = fetch_papers(query)
-    create_faiss_index(papers)
+    new_papers = fetch_papers(query)
+    create_faiss_index(new_papers)
 
     # Retrieve most relevant papers
     search_results = search_papers("optimal fermentation conditions for E. coli")
-    for idx, paper in enumerate(papers):
+    for idx, paper in enumerate(search_results):
         print(f"{idx+1}. {paper['title']}\n   {paper['url']}\n")
